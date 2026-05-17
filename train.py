@@ -410,11 +410,6 @@ def run_training_experiment() -> None:
         if bleu >= best_bleu:
             best_bleu = bleu
             save_checkpoint(model, optimizer, scheduler, epoch, "checkpoint.pt")
-            # Back up weights to W&B cloud (survives Kaggle session reset)
-            art = wandb.Artifact("checkpoint", type="model",
-                                  metadata={"epoch": epoch, "val_bleu": bleu})
-            art.add_file("checkpoint.pt")
-            wandb.log_artifact(art)
 
     test_bleu = evaluate_bleu(model, test_dl, train_ds.tgt_vocab, device)
     wandb.log({"test_bleu": test_bleu})
