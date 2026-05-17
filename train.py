@@ -42,7 +42,11 @@ class LabelSmoothingLoss(nn.Module):
 
     def __init__(self, vocab_size: int, pad_idx: int, smoothing: float = 0.1) -> None:
         super().__init__()
-        raise NotImplementedError
+        self.vocab_size = vocab_size
+        self.pad_idx = pad_idx
+        self.smoothing = smoothing
+        self.confidence = 1.0 - smoothing
+        self.criterion = nn.KLDivLoss(reduction="sum")
 
     def forward(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         """
@@ -53,8 +57,18 @@ class LabelSmoothingLoss(nn.Module):
         Returns:
             Scalar loss value.
         """
-        # TODO: Task 3.1
-        raise NotImplementedError
+        # logits: [N, V]  target: [N]
+        log_probs = torch.log_softmax(logits, dim=-1)
+
+        with torch.no_grad():
+            true_dist = torch.full_like(log_probs, self.smoothing / (self.vocab_size - 2))
+            true_dist.scatter_(1, target.unsqueeze(1), self.confidence)
+            true_dist[:, self.pad_idx] = 0.0
+            pad_mask = target == self.pad_idx
+            true_dist[pad_mask] = 0.0
+
+        n_tokens = (~pad_mask).sum().clamp(min=1)
+        return self.criterion(log_probs, true_dist) / n_tokens
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -88,7 +102,34 @@ def run_epoch(
         avg_loss : Average loss over the epoch (float).
 
     """
-    raise NotImplementedError
+    model.train() if is_train else model.eval()
+    total_loss, n_batches = 0.0, 0
+
+    for src, tgt in data_iter:
+        src, tgt = src.to(device), tgt.to(device)
+        tgt_in, tgt_out = tgt[:, :-1], tgt[:, 1:]      # teacher forcing shift
+
+        src_mask = make_src_mask(src)
+        tgt_mask = make_tgt_mask(tgt_in)
+
+        with torch.set_grad_enabled(is_train):
+            logits = model(src, tgt_in, src_mask, tgt_mask)   # [B, T, V]
+            loss = loss_fn(
+                logits.reshape(-1, logits.size(-1)),
+                tgt_out.reshape(-1),
+            )
+
+        if is_train:
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            if scheduler is not None:
+                scheduler.step()
+
+        total_loss += loss.item()
+        n_batches += 1
+
+    return total_loss / max(1, n_batches)
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -122,8 +163,20 @@ def greedy_decode(
              or when max_len is reached.
 
     """
-    # TODO: Task 3.3 — implement token-by-token greedy decoding
-    raise NotImplementedError
+    model.eval()
+    src = src.to(device)
+    src_mask = src_mask.to(device)
+    memory = model.encode(src, src_mask)
+
+    ys = torch.full((1, 1), start_symbol, dtype=torch.long, device=device)
+    for _ in range(max_len - 1):
+        tgt_mask = make_tgt_mask(ys)
+        logits = model.decode(memory, src_mask, ys, tgt_mask)   # [1, cur_len, V]
+        next_tok = logits[:, -1, :].argmax(dim=-1, keepdim=True)  # [1, 1]
+        ys = torch.cat([ys, next_tok], dim=1)
+        if next_tok.item() == end_symbol:
+            break
+    return ys
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -154,8 +207,60 @@ def evaluate_bleu(
         bleu_score : Corpus-level BLEU (float, range 0–100).
 
     """
-    # TODO: Task 3 — loop test set, decode, compute and return BLEU
-    raise NotImplementedError
+    from dataset import SOS_IDX, EOS_IDX, PAD_IDX
+
+    def to_tokens(ids):
+        out = []
+        for i in ids:
+            i = int(i)
+            if i in (SOS_IDX, PAD_IDX):
+                continue
+            if i == EOS_IDX:
+                break
+            out.append(tgt_vocab.lookup_token(i))
+        return out
+
+    model.eval()
+    hyps, refs = [], []
+    with torch.no_grad():
+        for src, tgt in test_dataloader:
+            for b in range(src.size(0)):
+                s = src[b : b + 1].to(device)
+                s_mask = make_src_mask(s).to(device)
+                pred = greedy_decode(
+                    model, s, s_mask, max_len, SOS_IDX, EOS_IDX, device
+                )[0]
+                hyps.append(to_tokens(pred.tolist()))
+                refs.append([to_tokens(tgt[b].tolist())])   # multi-ref format
+
+    return _corpus_bleu(hyps, refs) * 100.0
+
+
+def _corpus_bleu(hyps, refs, max_n: int = 4) -> float:
+    """Self-contained corpus BLEU-4 with brevity penalty (no extra deps)."""
+    import math
+    from collections import Counter
+
+    clipped = [0] * max_n
+    totals = [0] * max_n
+    hyp_len, ref_len = 0, 0
+
+    for hyp, ref_list in zip(hyps, refs):
+        hyp_len += len(hyp)
+        ref = min(ref_list, key=lambda r: (abs(len(r) - len(hyp)), len(r)))
+        ref_len += len(ref)
+        for n in range(1, max_n + 1):
+            h_ng = Counter(tuple(hyp[i : i + n]) for i in range(len(hyp) - n + 1))
+            r_ng = Counter(tuple(ref[i : i + n]) for i in range(len(ref) - n + 1))
+            totals[n - 1] += max(0, len(hyp) - n + 1)
+            for ng, c in h_ng.items():
+                clipped[n - 1] += min(c, r_ng.get(ng, 0))
+
+    if min(clipped) == 0:
+        return 0.0
+    log_p = sum((1.0 / max_n) * math.log(clipped[i] / totals[i]) for i in range(max_n))
+    bp = 1.0 if hyp_len > ref_len else math.exp(1 - ref_len / max(1, hyp_len))
+    return bp * math.exp(log_p)
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -192,8 +297,16 @@ def save_checkpoint(
          'd_model': ..., 'N': ..., 'num_heads': ...,
          'd_ff': ..., 'dropout': ...}
     """
-    # TODO: implement using torch.save({...}, path)
-    raise NotImplementedError
+    torch.save(
+        {
+            "epoch": epoch,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "scheduler_state_dict": scheduler.state_dict() if scheduler else None,
+            "model_config": model.config if hasattr(model, "config") else None,
+        },
+        path,
+    )
 
 
 def load_checkpoint(
@@ -215,8 +328,13 @@ def load_checkpoint(
         epoch : The epoch at which the checkpoint was saved (int).
 
     """
-    # TODO: implement restore logic
-    raise NotImplementedError
+    ckpt = torch.load(path, map_location="cpu")
+    model.load_state_dict(ckpt["model_state_dict"])
+    if optimizer is not None and ckpt.get("optimizer_state_dict"):
+        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+    if scheduler is not None and ckpt.get("scheduler_state_dict"):
+        scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+    return ckpt["epoch"]
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -246,8 +364,56 @@ def run_training_experiment() -> None:
                bleu = evaluate_bleu(model, test_loader, tgt_vocab)
                wandb.log({'test_bleu': bleu})
     """
-    # TODO: implement full experiment
-    raise NotImplementedError
+    import wandb
+    from torch.utils.data import DataLoader
+    from dataset import Multi30kDataset, collate_batch, PAD_IDX
+    from lr_scheduler import NoamScheduler
+
+    cfg = {
+        "d_model": 256, "N": 3, "num_heads": 8, "d_ff": 1024,
+        "dropout": 0.1, "batch_size": 128, "warmup_steps": 4000,
+        "num_epochs": 20, "min_freq": 2,
+    }
+    wandb.init(project="da6401-a3", config=cfg)
+    cfg = wandb.config
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    train_ds = Multi30kDataset("train", min_freq=cfg.min_freq)
+    val_ds   = Multi30kDataset("validation", train_ds.src_vocab, train_ds.tgt_vocab)
+    test_ds  = Multi30kDataset("test", train_ds.src_vocab, train_ds.tgt_vocab)
+
+    dl = lambda ds, sh: DataLoader(ds, batch_size=cfg.batch_size,
+                                   shuffle=sh, collate_fn=collate_batch)
+    train_dl, val_dl, test_dl = dl(train_ds, True), dl(val_ds, False), dl(test_ds, False)
+
+    model = Transformer(
+        src_vocab_size=len(train_ds.src_vocab),
+        tgt_vocab_size=len(train_ds.tgt_vocab),
+        d_model=cfg.d_model, N=cfg.N, num_heads=cfg.num_heads,
+        d_ff=cfg.d_ff, dropout=cfg.dropout,
+    ).to(device)
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=1.0,
+                                 betas=(0.9, 0.98), eps=1e-9)
+    scheduler = NoamScheduler(optimizer, cfg.d_model, cfg.warmup_steps)
+    loss_fn = LabelSmoothingLoss(len(train_ds.tgt_vocab), PAD_IDX, 0.1)
+
+    best_bleu = 0.0
+    for epoch in range(cfg.num_epochs):
+        tr = run_epoch(train_dl, model, loss_fn, optimizer, scheduler,
+                       epoch, is_train=True, device=device)
+        va = run_epoch(val_dl, model, loss_fn, None, None,
+                       epoch, is_train=False, device=device)
+        bleu = evaluate_bleu(model, val_dl, train_ds.tgt_vocab, device)
+        wandb.log({"train_loss": tr, "val_loss": va, "val_bleu": bleu,
+                   "epoch": epoch})
+        if bleu >= best_bleu:
+            best_bleu = bleu
+            save_checkpoint(model, optimizer, scheduler, epoch, "checkpoint.pt")
+
+    test_bleu = evaluate_bleu(model, test_dl, train_ds.tgt_vocab, device)
+    wandb.log({"test_bleu": test_bleu})
+    print(f"Final test BLEU: {test_bleu:.2f}")
 
 
 if __name__ == "__main__":
