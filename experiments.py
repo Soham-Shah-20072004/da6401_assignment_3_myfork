@@ -20,6 +20,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
+from tqdm.auto import tqdm
 
 import model as model_mod
 from model import Transformer, make_src_mask, make_tgt_mask
@@ -149,6 +150,7 @@ DEFAULTS = dict(
     name="baseline", project="da6401-a3",
     d_model=256, N=3, num_heads=8, d_ff=1024, dropout=0.1,
     batch_size=128, num_epochs=20, min_freq=2,
+    bleu_every=5,              # eval BLEU every N epochs (+ last); BLEU is slow
     scheduler="noam",          # "noam" | "fixed"
     warmup_steps=4000, fixed_lr=1e-4,
     label_smoothing=0.1,       # 2.5: 0.0 to disable
@@ -197,49 +199,70 @@ def _train_one(cfg, datasets):
         loss_fn = LabelSmoothingLoss(len(train_ds.tgt_vocab), PAD_IDX,
                                      cfg["label_smoothing"])
 
-        step, best_bleu = 0, 0.0
-        for epoch in range(cfg["num_epochs"]):
+        step, best_bleu, last_bleu = 0, 0.0, 0.0
+        n_ep = cfg["num_epochs"]
+        for epoch in range(n_ep):
             model.train()
-            ep_loss, ep_conf, nb = 0.0, 0.0, 0
-            for src, tgt in train_dl:
+            ep_loss, ep_ce, ep_conf, nb = 0.0, 0.0, 0.0, 0
+            pbar = tqdm(train_dl, leave=False,
+                        desc=f"[{cfg['name']}] epoch {epoch + 1}/{n_ep}")
+            for src, tgt in pbar:
                 src, tgt = src.to(device), tgt.to(device)
                 tin, tout = tgt[:, :-1], tgt[:, 1:]
                 logits = model(src, tin, make_src_mask(src), make_tgt_mask(tin))
-                loss = loss_fn(logits.reshape(-1, logits.size(-1)),
-                               tout.reshape(-1))
+                flat_logits = logits.reshape(-1, logits.size(-1))
+                flat_tgt = tout.reshape(-1)
+                loss = loss_fn(flat_logits, flat_tgt)
 
                 optimizer.zero_grad()
                 loss.backward()
 
-                log = {"step": step,
-                       "lr": optimizer.param_groups[0]["lr"]}
+                log = {"step": step, "lr": optimizer.param_groups[0]["lr"]}
                 if cfg["log_grad_norms"] and step < 1000:
                     log["qk_grad_norm"] = _qk_grad_norm(model)
-                if cfg["log_confidence"]:
-                    ep_conf += _confidence(logits.detach(), tout)
                 wandb.log(log)
 
                 optimizer.step()
                 if scheduler is not None:
                     scheduler.step()
-                ep_loss += loss.item(); nb += 1; step += 1
 
+                # raw (un-smoothed) CE → valid perplexity for §2.5
+                with torch.no_grad():
+                    ep_ce += F.cross_entropy(
+                        flat_logits, flat_tgt, ignore_index=PAD_IDX).item()
+                    if cfg["log_confidence"]:
+                        ep_conf += _confidence(logits, tout)
+                ep_loss += loss.item(); nb += 1; step += 1
+                pbar.set_postfix(loss=f"{loss.item():.3f}")
+
+            do_bleu = ((epoch + 1) % cfg["bleu_every"] == 0) or (epoch == n_ep - 1)
             val_acc = _val_accuracy(model, val_dl, device)
-            val_bleu = evaluate_bleu(model, val_dl, train_ds.tgt_vocab, device)
-            wandb.log({
+            mean_ce = ep_ce / max(1, nb)
+            ep_log = {
                 "epoch": epoch,
                 "train_loss": ep_loss / max(1, nb),
+                "train_ppl": math.exp(min(mean_ce, 20)),     # true perplexity
                 "val_accuracy": val_acc,
-                "val_bleu": val_bleu,
-                "train_confidence": ep_conf / max(1, nb) if cfg["log_confidence"] else None,
-            })
+            }
+            if cfg["log_confidence"]:
+                ep_log["train_confidence"] = ep_conf / max(1, nb)
+            if do_bleu:
+                last_bleu = evaluate_bleu(model, val_dl, train_ds.tgt_vocab, device)
+                ep_log["val_bleu"] = last_bleu
+            wandb.log(ep_log)
+            print(f"[{cfg['name']}] epoch {epoch + 1}/{n_ep}  "
+                  f"train_loss={ep_log['train_loss']:.3f}  "
+                  f"ppl={ep_log['train_ppl']:.1f}  "
+                  f"val_acc={val_acc:.3f}  "
+                  f"val_bleu={last_bleu:.2f}" + ("" if do_bleu else " (stale)"),
+                  flush=True)
 
-            if val_bleu >= best_bleu:
-                best_bleu = val_bleu
+            if do_bleu and last_bleu >= best_bleu:
+                best_bleu = last_bleu
                 ckpt = f"checkpoint_{cfg['name']}.pt"
                 save_checkpoint(model, optimizer, scheduler, epoch, ckpt)
                 art = wandb.Artifact(f"checkpoint-{cfg['name']}", type="model",
-                                     metadata={"epoch": epoch, "val_bleu": val_bleu})
+                                     metadata={"epoch": epoch, "val_bleu": last_bleu})
                 art.add_file(ckpt)
                 wandb.log_artifact(art)
 
