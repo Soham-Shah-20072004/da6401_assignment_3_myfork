@@ -498,7 +498,7 @@ class Transformer(nn.Module):
             if not os.path.exists(checkpoint_path):
                 import gdown  # lazy: not in requirements.txt
                 # TODO: replace with YOUR uploaded .pth Google-Drive file id
-                gdown.download(id="<.pth drive id>", output=checkpoint_path,
+                gdown.download(id="15X7of0L3awcux6m00UzXlhruuEaRzPUx", output=checkpoint_path,
                                quiet=False)
             ckpt = torch.load(checkpoint_path, map_location="cpu")
             state = ckpt.get("model_state_dict", ckpt) if isinstance(ckpt, dict) else ckpt
