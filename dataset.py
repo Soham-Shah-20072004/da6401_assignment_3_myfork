@@ -1,11 +1,9 @@
 """
-dataset.py — Multi30k loading, spaCy tokenization, vocabulary, batching
-DA6401 Assignment 3: "Attention Is All You Need"
+Multi30k loading, spacy tokenization, vocab and batching.
+German (de) is the source, English (en) is the target.
 
-Source = German (de), Target = English (en).
-
-Special tokens (indices fixed — pad_idx=1 matches model.make_*_mask defaults):
-    <unk> = 0   <pad> = 1   <sos> = 2   <eos> = 3
+Token indices: <unk>=0, <pad>=1, <sos>=2, <eos>=3 (pad=1 to match the
+default pad_idx used by make_src_mask/make_tgt_mask in model.py).
 """
 
 from collections import Counter
@@ -24,12 +22,8 @@ UNK_IDX, PAD_IDX, SOS_IDX, EOS_IDX = 0, 1, 2, 3
 SPECIALS = [UNK, PAD, SOS, EOS]
 
 
-# ──────────────────────────────────────────────────────────────────────
-#  Vocabulary
-# ──────────────────────────────────────────────────────────────────────
-
 class Vocab:
-    """word ↔ index map. Built from the TRAIN split only (data isolation)."""
+    """Word to index map, built only from the train split."""
 
     def __init__(self, counter: Counter, min_freq: int = 2) -> None:
         self.itos: List[str] = list(SPECIALS)
@@ -44,22 +38,15 @@ class Vocab:
     def encode(self, tokens: List[str]) -> List[int]:
         return [self.stoi.get(t, UNK_IDX) for t in tokens]
 
-    # autograder / evaluate_bleu compatibility
     def lookup_token(self, idx: int) -> str:
         return self.itos[idx]
 
 
-# ──────────────────────────────────────────────────────────────────────
-#  Dataset
-# ──────────────────────────────────────────────────────────────────────
-
 class Multi30kDataset(Dataset):
     """
-    Loads one split of bentrevett/multi30k and produces (src_ids, tgt_ids)
-    LongTensors, each wrapped with <sos> ... <eos>.
-
-    Vocabs are built once on the train split and shared with val/test by
-    passing them in (so val/test never leak vocabulary into training).
+    One split of bentrevett/multi30k as (src_ids, tgt_ids) long tensors,
+    each wrapped with <sos> ... <eos>. Build the vocab on the train split
+    and pass it to the val/test splits so they don't leak vocabulary.
     """
 
     _nlp_de = None
@@ -71,14 +58,13 @@ class Multi30kDataset(Dataset):
         self.data = load_dataset("bentrevett/multi30k", split=split)
 
         if Multi30kDataset._nlp_de is None:
-            # spacy.blank → tokenizer-only (no model download). Tokenization
-            # rules live in the Language class, so tokens are identical to
-            # spacy.load("*_core_*").tokenizer — keeps trained vocab valid
-            # while removing the autograder's spaCy-model dependency.
+            # blank pipelines = tokenizer only, no model package to
+            # download. The tokenizer rules are part of the language, so
+            # the tokens match spacy.load("*_core_*").tokenizer and the
+            # trained vocab stays valid.
             Multi30kDataset._nlp_de = spacy.blank("de")
             Multi30kDataset._nlp_en = spacy.blank("en")
 
-        # Tokenize (lowercase) once up front.
         self.src_tok = [self._tok_de(ex["de"]) for ex in self.data]
         self.tgt_tok = [self._tok_en(ex["en"]) for ex in self.data]
 
@@ -90,7 +76,6 @@ class Multi30kDataset(Dataset):
         else:
             self.src_vocab, self.tgt_vocab = src_vocab, tgt_vocab
 
-    # -- tokenizers --------------------------------------------------
     def _tok_de(self, s: str) -> List[str]:
         return [t.text for t in Multi30kDataset._nlp_de.tokenizer(s.lower())]
 
@@ -104,7 +89,6 @@ class Multi30kDataset(Dataset):
             c.update(toks)
         return c
 
-    # -- Dataset protocol -------------------------------------------
     def __len__(self) -> int:
         return len(self.src_tok)
 
@@ -114,12 +98,8 @@ class Multi30kDataset(Dataset):
         return torch.tensor(src, dtype=torch.long), torch.tensor(tgt, dtype=torch.long)
 
 
-# ──────────────────────────────────────────────────────────────────────
-#  Collate — pad a batch to its longest sequence
-# ──────────────────────────────────────────────────────────────────────
-
 def collate_batch(batch):
-    """batch: list of (src_ids, tgt_ids). Returns padded [B, Ls], [B, Lt]."""
+    """Pad a list of (src_ids, tgt_ids) to the longest in the batch."""
     src, tgt = zip(*batch)
     src = pad_sequence(src, batch_first=True, padding_value=PAD_IDX)
     tgt = pad_sequence(tgt, batch_first=True, padding_value=PAD_IDX)
