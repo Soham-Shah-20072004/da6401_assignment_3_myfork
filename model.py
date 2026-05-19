@@ -456,10 +456,15 @@ class Transformer(nn.Module):
         dropout        (float): Dropout probability (default 0.1).
     """
 
+    # Trained-checkpoint location. The autograder does `Transformer()` then
+    # `.infer()`, so weights are fetched lazily inside infer()/_load_pretrained.
+    CHECKPOINT_DRIVE_ID = "15X7of0L3awcux6m00UzXlhruuEaRzPUx"
+    CHECKPOINT_PATH     = "checkpoint_baseline.pt"
+
     def __init__(
         self,
-        src_vocab_size: int,
-        tgt_vocab_size: int,
+        src_vocab_size: int = 1,
+        tgt_vocab_size: int = 1,
         d_model:   int   = 512,
         N:         int   = 6,
         num_heads: int   = 8,
@@ -468,6 +473,16 @@ class Transformer(nn.Module):
         checkpoint_path: str = None,
     ) -> None:
         super().__init__()
+        self._build(src_vocab_size, tgt_vocab_size, d_model, N,
+                    num_heads, d_ff, dropout)
+        self._weights_loaded = False
+        if checkpoint_path is not None:
+            self._load_pretrained(checkpoint_path)
+
+    def _build(self, src_vocab_size, tgt_vocab_size, d_model, N,
+               num_heads, d_ff, dropout) -> None:
+        """(Re)construct all submodules. Called from __init__, and again from
+        _load_pretrained once the checkpoint's true config is known."""
         self.d_model = d_model
         self.config = {
             "src_vocab_size": src_vocab_size,
@@ -493,16 +508,21 @@ class Transformer(nn.Module):
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
 
-        # Autograder hook (upstream): optionally download + load trained weights.
-        if checkpoint_path is not None:
-            if not os.path.exists(checkpoint_path):
-                import gdown  # lazy: not in requirements.txt
-                # TODO: replace with YOUR uploaded .pth Google-Drive file id
-                gdown.download(id="15X7of0L3awcux6m00UzXlhruuEaRzPUx", output=checkpoint_path,
-                               quiet=False)
-            ckpt = torch.load(checkpoint_path, map_location="cpu")
-            state = ckpt.get("model_state_dict", ckpt) if isinstance(ckpt, dict) else ckpt
-            self.load_state_dict(state)
+    def _load_pretrained(self, path: str) -> None:
+        """Download (if missing) and load trained weights, rebuilding the
+        architecture from the checkpoint's saved model_config first."""
+        if not os.path.exists(path):
+            import gdown  # lazy: not in requirements.txt
+            gdown.download(id=self.CHECKPOINT_DRIVE_ID, output=path, quiet=False)
+        ckpt = torch.load(path, map_location="cpu")
+        if isinstance(ckpt, dict) and ckpt.get("model_config"):
+            device = next(self.parameters()).device
+            self._build(**ckpt["model_config"])
+            self.to(device)
+        state = ckpt.get("model_state_dict", ckpt) if isinstance(ckpt, dict) else ckpt
+        self.load_state_dict(state)
+        self.eval()
+        self._weights_loaded = True
 
     # ── AUTOGRADER HOOKS ── keep these signatures exactly ─────────────
 
@@ -580,6 +600,11 @@ class Transformer(nn.Module):
         Returns:
             The fully translated English string, detokenized and clean.
         """
+        # Ensure trained weights are present (autograder builds Transformer()
+        # with no checkpoint_path, so load on first infer()).
+        if not getattr(self, "_weights_loaded", False):
+            self._load_pretrained(self.CHECKPOINT_PATH)
+
         # Lazily obtain vocabs + tokenizer. Training script may attach
         # self.src_vocab / self.tgt_vocab; otherwise rebuild from train split.
         import dataset as ds
