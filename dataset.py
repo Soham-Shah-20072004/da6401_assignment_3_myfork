@@ -71,8 +71,12 @@ class Multi30kDataset(Dataset):
         self.data = load_dataset("bentrevett/multi30k", split=split)
 
         if Multi30kDataset._nlp_de is None:
-            Multi30kDataset._nlp_de = spacy.load("de_core_news_sm")
-            Multi30kDataset._nlp_en = spacy.load("en_core_web_sm")
+            # spacy.blank → tokenizer-only (no model download). Tokenization
+            # rules live in the Language class, so tokens are identical to
+            # spacy.load("*_core_*").tokenizer — keeps trained vocab valid
+            # while removing the autograder's spaCy-model dependency.
+            Multi30kDataset._nlp_de = spacy.blank("de")
+            Multi30kDataset._nlp_en = spacy.blank("en")
 
         # Tokenize (lowercase) once up front.
         self.src_tok = [self._tok_de(ex["de"]) for ex in self.data]
